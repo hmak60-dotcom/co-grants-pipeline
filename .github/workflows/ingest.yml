@@ -23,12 +23,13 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Run full ingestion
-       env:
+        env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CANDID_API_KEY: ${{ secrets.CANDID_API_KEY }}
           CDE_DISTRICT_DIRECTORY_URL: ${{ secrets.CDE_DISTRICT_DIRECTORY_URL }}
+        run: node ingest/index.js --source=all
 
       - name: Upload debug screenshot on failure
         if: failure()
