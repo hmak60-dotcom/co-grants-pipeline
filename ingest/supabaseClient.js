@@ -32,14 +32,24 @@ export async function upsertGrants(grantRows) {
     last_seen_at: new Date().toISOString(),
   }));
 
+  // Postgres's ON CONFLICT DO UPDATE can't touch the same row twice within
+  // a single upsert command. Multiple search terms can surface the same
+  // underlying grant, producing duplicate source_keys in one batch — collapse
+  // those down to one row per key before sending to Supabase.
+  const dedupedByKey = new Map();
+  for (const row of rows) {
+    dedupedByKey.set(row.source_key, row); // last one wins, fine since they're near-identical
+  }
+  const dedupedRows = Array.from(dedupedByKey.values());
+
   const { data, error } = await supabase
     .from("grants")
-    .upsert(rows, { onConflict: "source_key", ignoreDuplicates: false })
+    .upsert(dedupedRows, { onConflict: "source_key", ignoreDuplicates: false })
     .select("id");
 
   if (error) {
     console.error("upsertGrants error:", error);
-    return { inserted: 0, updated: 0, failed: rows.length, error };
+    return { inserted: 0, updated: 0, failed: dedupedRows.length, error };
   }
   return { inserted: data.length, updated: 0, failed: 0 };
 }
