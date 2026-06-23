@@ -2,21 +2,6 @@ import fetch from "node-fetch";
 import * as XLSX from "xlsx";
 import { supabase } from "./supabaseClient.js";
 
-/**
- * Pulls district-level demographic and financial indicators from CDE.
- *
- * FINANCIAL DATA — confirmed working pattern (verified June 2026):
- * CDE's K12 Financial Transparency site exposes a per-district Excel
- * download at:
- *   https://www.cde.state.co.us/schoolview/financialtransparency/downloadreport/district/{ORG_CODE}
- * We loop over every district already in Supabase and hit this endpoint
- * once per district.
- *
- * FRL / ELL / SPED / GIFTED DATA — CDE publishes these as statewide files,
- * but small counts are suppressed for privacy. See
- * fetchInstructionalProgramCounts() below — needs a manually-found URL.
- */
-
 const CDE_FINANCIAL_BASE = "https://www.cde.state.co.us/schoolview/financialtransparency/downloadreport/district";
 const SAIPE_API_BASE = "https://api.census.gov/data/timeseries/poverty/saipe/schdist";
 
@@ -62,22 +47,30 @@ function toNumber(val) {
   return Number.isFinite(n) ? n : null;
 }
 
-function parseXlsxWithHeaderDetection(buffer) {
-  const workbook = XLSX.read(buffer, { type: "buffer" });
-  const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-  const rawRows = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: null });
+const CDE_INSTRUCTIONAL_PROGRAMS_URL = process.env.CDE_INSTRUCTIONAL_PROGRAMS_URL || null;
 
-  const headerRowIndex = rawRows.findIndex((row) => {
-    const nonEmptyCells = row.filter((c) => c !== null && c !== "");
-    return nonEmptyCells.length >= 3 && nonEmptyCells.every((c) => typeof c === "string" && c.length < 80);
-  });
-
-  if (headerRowIndex === -1) return XLSX.utils.sheet_to_json(firstSheet, { defval: null });
+/**
+ * This file is MULTI-SHEET (confirmed from a real downloaded copy, June 2026):
+ *   - "FRL_K12" sheet: Free/Reduced Lunch counts + percentages per district
+ *   - "IPST" sheet: Special Education, Multilingual Learner (EL), Gifted and
+ *     Talented, Homeless, Section 504, Immigrant, Migrant counts + percentages
+ * Each sheet has 2 title rows above the real header row (row 3), and a
+ * "Statewide Total" row right after the header that we skip (org code "-").
+ */
+function parseNamedSheet(workbook, sheetName) {
+  const sheet = workbook.Sheets[sheetName];
+  if (!sheet) {
+    console.warn(`[districtDemographics] Sheet "${sheetName}" not found. Available sheets:`, workbook.SheetNames);
+    return [];
+  }
+  const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+  const headerRowIndex = rawRows.findIndex((row) => row[0] === "Organization Code");
+  if (headerRowIndex === -1) return [];
 
   const headers = rawRows[headerRowIndex];
   return rawRows
     .slice(headerRowIndex + 1)
-    .filter((row) => row.some((c) => c !== null && c !== ""))
+    .filter((row) => row[0] && row[0] !== "-")
     .map((row) => {
       const obj = {};
       headers.forEach((h, i) => { if (h) obj[h] = row[i] ?? null; });
@@ -85,14 +78,11 @@ function parseXlsxWithHeaderDetection(buffer) {
     });
 }
 
-const CDE_INSTRUCTIONAL_PROGRAMS_URL = process.env.CDE_INSTRUCTIONAL_PROGRAMS_URL || null;
-
 export async function fetchInstructionalProgramCounts() {
   if (!CDE_INSTRUCTIONAL_PROGRAMS_URL) {
     console.warn(
       "[districtDemographics] CDE_INSTRUCTIONAL_PROGRAMS_URL not set — FRL/ELL/SPED/Gifted " +
-      "counts will stay null. Find the current file link at " +
-      "https://www.cde.state.co.us/cdereval/pupilcurrent and set it as a GitHub secret."
+      "counts will stay null."
     );
     return new Map();
   }
@@ -109,20 +99,41 @@ export async function fetchInstructionalProgramCounts() {
       return new Map();
     }
     const buffer = await res.arrayBuffer();
-    const rows = parseXlsxWithHeaderDetection(buffer);
-    if (rows.length) console.log("[districtDemographics] Instructional programs columns:", Object.keys(rows[0]));
+    const workbook = XLSX.read(buffer, { type: "buffer" });
+    console.log("[districtDemographics] Available sheets in pupil membership file:", workbook.SheetNames);
+
+    const frlRows = parseNamedSheet(workbook, "FRL_K12");
+    const ipstRows = parseNamedSheet(workbook, "IPST");
+    console.log(`[districtDemographics] Parsed ${frlRows.length} FRL rows and ${ipstRows.length} IPST rows.`);
 
     const map = new Map();
-    for (const row of rows) {
-      const orgCode = pick(row, "Org Code", "District Code", "Organization Code");
-      if (!orgCode) continue;
-      map.set(String(orgCode).trim(), {
-        ell_count: toNumber(pick(row, "EL Count", "English Learner Count", "ELL Count")),
-        special_education_count: toNumber(pick(row, "Special Education", "SPED Count", "IEP Count")),
-        gifted_count: toNumber(pick(row, "Gifted", "GT Count", "Gifted and Talented")),
-        frl_count: toNumber(pick(row, "FRL Count", "Free and Reduced Count")),
-      });
+
+    for (const row of frlRows) {
+      const orgCode = String(row["Organization Code"]).trim();
+      if (!map.has(orgCode)) map.set(orgCode, {});
+      const rec = map.get(orgCode);
+      rec.frl_count = toNumber(row["Free and Reduced\nCount"]);
+      const frlPercent = toNumber(row["Free and Reduced\nPercent"]);
+      if (frlPercent != null) rec.frl_rate = Math.round(frlPercent * 1000) / 10;
     }
+
+    for (const row of ipstRows) {
+      const orgCode = String(row["Organization Code"]).trim();
+      if (!map.has(orgCode)) map.set(orgCode, {});
+      const rec = map.get(orgCode);
+      rec.special_education_count = toNumber(row["Special Education \nCount"]);
+      const sedPercent = toNumber(row["Special Education\nPercent"]);
+      if (sedPercent != null) rec.special_education_rate = Math.round(sedPercent * 1000) / 10;
+
+      rec.ell_count = toNumber(row["Multilingual Learner: \nNEP, LEP, \nFEP Monitor Year 1 and Monitor Year 2\nCount"]);
+      const ellPercent = toNumber(row["Multilingual Learner: \nNEP, LEP, \nFEP Monitor Year 1 and Monitor Year 2\nPercent"]);
+      if (ellPercent != null) rec.ell_rate = Math.round(ellPercent * 1000) / 10;
+
+      rec.gifted_count = toNumber(row["Gifted and Talented \nCount"]);
+      const giftedPercent = toNumber(row["Gifted and Talented\nPercent"]);
+      if (giftedPercent != null) rec.gifted_rate = Math.round(giftedPercent * 1000) / 10;
+    }
+
     return map;
   } catch (err) {
     console.error("[districtDemographics] Instructional programs fetch error:", err.message);
@@ -134,10 +145,7 @@ export async function fetchSaipePovertyByDistrict(year = 2023) {
   const apiKey = process.env.CENSUS_API_KEY || "";
   const keyParam = apiKey ? `&key=${apiKey}` : "";
   if (!apiKey) {
-    console.warn(
-      "[districtDemographics] No CENSUS_API_KEY set. Sign up free at " +
-      "https://api.census.gov/data/key_signup.html and add as GitHub secret CENSUS_API_KEY."
-    );
+    console.warn("[districtDemographics] No CENSUS_API_KEY set.");
   }
   const url = `${SAIPE_API_BASE}?get=SD_NAME,SAEPOVRT5_17R_PT&for=school%20district%20(unified):*&in=state:08&YEAR=${year}${keyParam}`;
   try {
@@ -245,10 +253,10 @@ export async function fetchDistrictDemographics() {
       Object.assign(rec, inst);
       const enrollment = rec.total_enrollment;
       if (enrollment) {
-        if (rec.ell_count != null) rec.ell_rate = Math.round((rec.ell_count / enrollment) * 1000) / 10;
-        if (rec.special_education_count != null) rec.special_education_rate = Math.round((rec.special_education_count / enrollment) * 1000) / 10;
-        if (rec.gifted_count != null) rec.gifted_rate = Math.round((rec.gifted_count / enrollment) * 1000) / 10;
-        if (rec.frl_count != null) rec.frl_rate = Math.round((rec.frl_count / enrollment) * 1000) / 10;
+        if (rec.ell_rate == null && rec.ell_count != null) rec.ell_rate = Math.round((rec.ell_count / enrollment) * 1000) / 10;
+        if (rec.special_education_rate == null && rec.special_education_count != null) rec.special_education_rate = Math.round((rec.special_education_count / enrollment) * 1000) / 10;
+        if (rec.gifted_rate == null && rec.gifted_count != null) rec.gifted_rate = Math.round((rec.gifted_count / enrollment) * 1000) / 10;
+        if (rec.frl_rate == null && rec.frl_count != null) rec.frl_rate = Math.round((rec.frl_count / enrollment) * 1000) / 10;
       }
     }
 
