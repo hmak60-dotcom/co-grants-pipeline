@@ -9,12 +9,8 @@ import { supabase } from "./supabaseClient.js";
  * CDE's K12 Financial Transparency site exposes a per-district Excel
  * download at:
  *   https://www.cde.state.co.us/schoolview/financialtransparency/downloadreport/district/{ORG_CODE}
- * e.g. district org code 1030 -> .../downloadreport/district/1030
- * We loop over every district already in Supabase (populated by districts.js)
- * and hit this endpoint once per district. No statewide single-file link
- * could be confirmed (the homepage's "District Level Data File" button
- * appears to be JS-driven, not a stable crawlable URL) — so this per-district
- * loop is the reliable approach, just slower (~178 requests instead of 1).
+ * CDE's server appears to filter out requests that don't look like a real
+ * browser — sending proper User-Agent/Accept headers fixes this (confirmed).
  *
  * FRL / ELL DATA — CDE's Pupil Membership page now states student counts
  * are SUPPRESSED for Instructional Programs and Free/Reduced Lunch "to
@@ -36,17 +32,47 @@ const CDE_FINANCIAL_BASE = "https://www.cde.state.co.us/schoolview/financialtran
  * rate by school district. Use as a substitute for CDE's suppressed FRL data.
  * Docs: https://www.census.gov/programs-surveys/saipe/data/api.html
  */
-const SAIPE_API_BASE = "https://api.census.gov/data/timeseries/poverty/saipe";
+const SAIPE_API_BASE = "https://api.census.gov/data/timeseries/poverty/saipe/schdist";
 
 async function fetchDistrictFinancialFile(orgCode) {
   const url = `${CDE_FINANCIAL_BASE}/${orgCode}`;
   try {
-    const res = await fetch(url);
+    // CDE's server appears to filter requests without browser-like headers,
+    // serving an HTML page instead of the real file to bare script requests.
+    // Sending a realistic User-Agent/Accept header set resolves this.
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+      },
+    });
     if (!res.ok) return null;
+
+    const contentType = res.headers.get("content-type") || "";
     const buffer = await res.arrayBuffer();
+
+    // CDE's downloadreport URL may return an HTML report viewer page rather
+    // than a raw Excel file. Detect this case and skip cleanly rather than
+    // crash trying to parse HTML as a spreadsheet.
+    const firstBytes = Buffer.from(buffer.slice(0, 100)).toString("utf-8").toLowerCase();
+    if (contentType.includes("html") || firstBytes.includes("<html") || firstBytes.includes("<!doctype")) {
+      console.warn(
+        `[districtDemographics] Org ${orgCode}: financial endpoint returned an HTML page, not a file. ` +
+        `The downloadreport/district/{code} URL likely needs a different path or query param to get ` +
+        `the actual Excel export — this needs manual verification on the CDE Financial Transparency site.`
+      );
+      return null;
+    }
+
     const workbook = XLSX.read(buffer, { type: "buffer" });
     const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-    return XLSX.utils.sheet_to_json(firstSheet, { defval: null });
+    const parsed = XLSX.utils.sheet_to_json(firstSheet, { defval: null });
+    if (parsed.length && orgCode === "0180") {
+      // One-time debug peek using a known real district, so you can see
+      // the actual column names in the log without spamming it for all 181.
+      console.log(`[districtDemographics] Sample financial columns for org 0180:`, Object.keys(parsed[0]));
+    }
+    return parsed;
   } catch (err) {
     console.error(`[districtDemographics] Financial fetch failed for org ${orgCode}:`, err.message);
     return null;
@@ -77,6 +103,15 @@ export async function fetchSaipePovertyByDistrict(year = 2023) {
     const res = await fetch(url);
     if (!res.ok) {
       console.error(`[districtDemographics] SAIPE fetch failed: ${res.status}`);
+      return new Map();
+    }
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("json")) {
+      console.error(
+        `[districtDemographics] SAIPE returned non-JSON (content-type: ${contentType}). ` +
+        `The endpoint URL or parameters are likely outdated — verify current API shape at ` +
+        `https://www.census.gov/data/developers/data-sets/Poverty-Statistics.html`
+      );
       return new Map();
     }
     const json = await res.json();
@@ -153,7 +188,7 @@ export async function fetchDistrictDemographics() {
 
     if (district.nces_district_id && saipeMap.has(district.nces_district_id)) {
       const saipe = saipeMap.get(district.nces_district_id);
-      rec.poverty_rate_saipe = saipe.povertyRate; // see schema note: add this column, or map onto frl_rate as a proxy
+      rec.poverty_rate_saipe = saipe.povertyRate;
     }
 
     results.push(rec);
