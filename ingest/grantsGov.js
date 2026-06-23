@@ -24,6 +24,26 @@ const SEARCH_TERMS = [
   "school mental health",
   "after school program",
   "teacher professional development",
+  "early childhood education",
+  "rural education",
+  "gifted education",
+  "school safety",
+  "computer science education",
+  "arts education",
+  "school nutrition",
+  "homeless education",
+  "foster youth education",
+  "dual enrollment",
+  "school counseling",
+  "bullying prevention",
+  "school library",
+  "Title I",
+  "IDEA special education",
+  "workforce development youth",
+  "summer learning",
+  "school improvement",
+  "education technology",
+  "civics education",
 ];
 
 export async function fetchGrantsGovOpportunities() {
@@ -36,8 +56,8 @@ export async function fetchGrantsGovOpportunities() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           keyword: term,
-          rows: 50,
-          oppStatuses: "forecasted|posted", // only currently relevant opportunities
+          rows: 100,
+          oppStatuses: "forecasted|posted",
         }),
       });
 
@@ -54,7 +74,6 @@ export async function fetchGrantsGovOpportunities() {
     }
   }
 
-  // Dedupe by opportunity number
   const seen = new Set();
   const deduped = allResults.filter((r) => {
     const key = r.opportunityNumber || r.id;
@@ -66,10 +85,6 @@ export async function fetchGrantsGovOpportunities() {
   return deduped;
 }
 
-/**
- * Fetch full detail for a single opportunity (needed to get eligibility text,
- * award ceiling/floor, and close date — the search endpoint only gives summaries).
- */
 export async function fetchGrantsGovDetail(opportunityId) {
   try {
     const res = await fetch(`${BASE}/fetchOpportunity`, {
@@ -86,10 +101,6 @@ export async function fetchGrantsGovDetail(opportunityId) {
   }
 }
 
-/**
- * Convenience: fetch search results AND hydrate each with full detail.
- * Rate-limited with a small delay since this is a public API with no key.
- */
 export async function fetchGrantsGovFull() {
   const summaries = await fetchGrantsGovOpportunities();
   const full = [];
@@ -97,7 +108,7 @@ export async function fetchGrantsGovFull() {
   for (const s of summaries) {
     const detail = await fetchGrantsGovDetail(s.id || s.opportunityId);
     full.push({ summary: s, detail });
-    await new Promise((r) => setTimeout(r, 250)); // be polite, avoid rate limiting
+    await new Promise((r) => setTimeout(r, 250));
   }
 
   return full;
