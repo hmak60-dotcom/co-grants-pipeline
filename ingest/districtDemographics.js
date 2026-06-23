@@ -76,11 +76,14 @@ async function fetchDistrictFinancialFile(orgCode) {
     const parsed = XLSX.utils.sheet_to_json(firstSheet, { defval: null });
     if (parsed.length && orgCode === "0180") {
       console.log(`[districtDemographics] Sample financial columns for org 0180:`, Object.keys(parsed[0]));
-      const uniqueCategories = [...new Set(parsed.map((r) => r.CATEGORY).filter(Boolean))];
-      const uniqueSpendFund = [...new Set(parsed.map((r) => r.SPENDING_FUNDING).filter(Boolean))];
-      console.log(`[districtDemographics] Unique CATEGORY values for org 0180:`, uniqueCategories);
-      console.log(`[districtDemographics] Unique SPENDING_FUNDING values for org 0180:`, uniqueSpendFund);
-      console.log(`[districtDemographics] Sample row for org 0180:`, JSON.stringify(parsed[0]));
+      const fundingRows = parsed.filter((r) => r.SPENDING_FUNDING === "Funding" && r.CATEGORY === "Funding Sources");
+      console.log(`[districtDemographics] Found ${fundingRows.length} rows with CATEGORY="Funding Sources" for org 0180.`);
+      if (fundingRows.length) {
+        console.log(`[districtDemographics] Sample "Funding Sources" row:`, JSON.stringify(fundingRows[0]));
+        console.log(`[districtDemographics] Unique SUB_ROLLUP values:`, [...new Set(fundingRows.map((r) => r.SUB_ROLLUP).filter(Boolean))]);
+        console.log(`[districtDemographics] Unique ROLLUP values:`, [...new Set(fundingRows.map((r) => r.ROLLUP).filter(Boolean))]);
+        console.log(`[districtDemographics] Unique FUND_DESC values:`, [...new Set(fundingRows.map((r) => r.FUND_DESC).filter(Boolean))]);
+      }
     }
     return parsed;
   } catch (err) {
