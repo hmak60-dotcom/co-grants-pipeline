@@ -9,20 +9,14 @@ import { supabase } from "./supabaseClient.js";
  * CDE's K12 Financial Transparency site exposes a per-district Excel
  * download at:
  *   https://www.cde.state.co.us/schoolview/financialtransparency/downloadreport/district/{ORG_CODE}
- * CDE's server appears to filter out requests that don't look like a real
- * browser — sending proper User-Agent/Accept headers fixes this (confirmed).
+ * CDE's server filters out requests without browser-like headers —
+ * sending proper User-Agent/Accept headers resolves this.
+ * Confirmed real columns: CATEGORY, AMOUNT, SPENDING_FUNDING (among others).
  *
  * FRL / ELL DATA — CDE's Pupil Membership page now states student counts
  * are SUPPRESSED for Instructional Programs and Free/Reduced Lunch "to
- * protect student privacy" (confirmed on their site as of this writing).
- * There is currently no public statewide file with these district-level
- * counts. Options if you need this data:
- *   1. Submit a CDE Data Request (form linked from their Pupil Membership page)
- *   2. Use Census SAIPE district-level poverty estimates as a poverty proxy
- *      (see fetchSaipePovertyByDistrict below) — federally maintained, no
- *      privacy suppression, but it's a poverty estimate, not CDE's own FRL number
- * This file leaves ell_count/ell_rate/frl_count as null unless you wire in
- * one of those alternatives.
+ * protect student privacy". This file leaves ell_count/ell_rate/frl_count
+ * as null — see comments below for alternatives if you need this later.
  */
 
 const CDE_FINANCIAL_BASE = "https://www.cde.state.co.us/schoolview/financialtransparency/downloadreport/district";
@@ -37,9 +31,6 @@ const SAIPE_API_BASE = "https://api.census.gov/data/timeseries/poverty/saipe/sch
 async function fetchDistrictFinancialFile(orgCode) {
   const url = `${CDE_FINANCIAL_BASE}/${orgCode}`;
   try {
-    // CDE's server appears to filter requests without browser-like headers,
-    // serving an HTML page instead of the real file to bare script requests.
-    // Sending a realistic User-Agent/Accept header set resolves this.
     const res = await fetch(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -51,15 +42,10 @@ async function fetchDistrictFinancialFile(orgCode) {
     const contentType = res.headers.get("content-type") || "";
     const buffer = await res.arrayBuffer();
 
-    // CDE's downloadreport URL may return an HTML report viewer page rather
-    // than a raw Excel file. Detect this case and skip cleanly rather than
-    // crash trying to parse HTML as a spreadsheet.
     const firstBytes = Buffer.from(buffer.slice(0, 100)).toString("utf-8").toLowerCase();
     if (contentType.includes("html") || firstBytes.includes("<html") || firstBytes.includes("<!doctype")) {
       console.warn(
-        `[districtDemographics] Org ${orgCode}: financial endpoint returned an HTML page, not a file. ` +
-        `The downloadreport/district/{code} URL likely needs a different path or query param to get ` +
-        `the actual Excel export — this needs manual verification on the CDE Financial Transparency site.`
+        `[districtDemographics] Org ${orgCode}: financial endpoint returned an HTML page, not a file.`
       );
       return null;
     }
@@ -68,8 +54,6 @@ async function fetchDistrictFinancialFile(orgCode) {
     const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
     const parsed = XLSX.utils.sheet_to_json(firstSheet, { defval: null });
     if (parsed.length && orgCode === "0180") {
-      // One-time debug peek using a known real district, so you can see
-      // the actual column names in the log without spamming it for all 181.
       console.log(`[districtDemographics] Sample financial columns for org 0180:`, Object.keys(parsed[0]));
     }
     return parsed;
@@ -94,11 +78,10 @@ function toNumber(val) {
 
 /**
  * Pulls child poverty rate by school district from Census SAIPE.
- * State FIPS 08 = Colorado. Returns a map keyed by NCES district ID,
- * since SAIPE uses NCES district codes, not CDE org codes.
+ * State FIPS 08 = Colorado.
  */
 export async function fetchSaipePovertyByDistrict(year = 2023) {
-  const url = `${SAIPE_API_BASE}?get=NAME,SAEPOVRT5_17RV_PT&for=school%20district%20(unified):*&in=state:08&time=${year}`;
+  const url = `${SAIPE_API_BASE}?get=SD_NAME,SAEPOVRT5_17R_PT&for=school%20district%20(unified):*&in=state:08&YEAR=${year}`;
   try {
     const res = await fetch(url);
     if (!res.ok) {
@@ -116,13 +99,13 @@ export async function fetchSaipePovertyByDistrict(year = 2023) {
     }
     const json = await res.json();
     const [header, ...rows] = json;
-    const nameIdx = header.indexOf("NAME");
-    const povertyIdx = header.indexOf("SAEPOVRT5_17RV_PT");
+    const nameIdx = header.indexOf("SD_NAME");
+    const povertyIdx = header.indexOf("SAEPOVRT5_17R_PT");
     const distIdx = header.indexOf("school district (unified)");
 
     const map = new Map();
     for (const row of rows) {
-      const ncesId = `08${row[distIdx]}`; // SAIPE district codes combine with state FIPS to form NCES-style IDs
+      const ncesId = `08${row[distIdx]}`;
       map.set(ncesId, {
         name: row[nameIdx],
         povertyRate: toNumber(row[povertyIdx]),
@@ -135,9 +118,6 @@ export async function fetchSaipePovertyByDistrict(year = 2023) {
   }
 }
 
-/**
- * Fetch existing districts from Supabase so we know which org codes to loop over.
- */
 async function getExistingDistricts() {
   const { data, error } = await supabase
     .from("districts")
@@ -159,19 +139,19 @@ export async function fetchDistrictDemographics() {
   const saipeMap = await fetchSaipePovertyByDistrict();
   const results = [];
 
-  // Loop financial downloads with a small delay — be polite to CDE's server
   for (const district of districts) {
     const rec = { cde_org_code: district.cde_org_code };
 
     if (district.cde_org_code) {
       const financialRows = await fetchDistrictFinancialFile(district.cde_org_code);
       if (financialRows && financialRows.length) {
-        // CDE's per-district export format needs confirming once you've
-        // actually opened one — adjust these field names to match exactly.
         let local = 0, state = 0, federal = 0;
         for (const row of financialRows) {
-          const category = pick(row, "Category", "Revenue Category", "Source");
-          const amount = toNumber(pick(row, "Amount", "Total"));
+          const spendingOrFunding = pick(row, "SPENDING_FUNDING");
+          if (spendingOrFunding && !/fund/i.test(spendingOrFunding)) continue;
+
+          const category = pick(row, "CATEGORY", "Category", "Revenue Category", "Source");
+          const amount = toNumber(pick(row, "AMOUNT", "Amount", "Total"));
           if (!category || amount == null) continue;
           if (/local/i.test(category)) local += amount;
           else if (/state/i.test(category)) state += amount;
@@ -183,7 +163,7 @@ export async function fetchDistrictDemographics() {
         rec.total_revenue = (local + state + federal) || null;
         rec.demographics_source_url = `${CDE_FINANCIAL_BASE}/${district.cde_org_code}`;
       }
-      await new Promise((r) => setTimeout(r, 300)); // polite delay between requests
+      await new Promise((r) => setTimeout(r, 300));
     }
 
     if (district.nces_district_id && saipeMap.has(district.nces_district_id)) {
@@ -197,11 +177,6 @@ export async function fetchDistrictDemographics() {
   return results;
 }
 
-/**
- * Merge demographic data into the existing districts table by cde_org_code.
- * Districts must already exist (from districts.js / NCES ingestion) —
- * this only updates, it doesn't create new district rows.
- */
 export async function upsertDistrictDemographics(demographicRows) {
   let updated = 0;
   let failed = 0;
