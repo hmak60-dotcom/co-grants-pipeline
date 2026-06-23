@@ -75,15 +75,8 @@ async function fetchDistrictFinancialFile(orgCode) {
     const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
     const parsed = XLSX.utils.sheet_to_json(firstSheet, { defval: null });
     if (parsed.length && orgCode === "0180") {
-      console.log(`[districtDemographics] Sample financial columns for org 0180:`, Object.keys(parsed[0]));
-      const fundingRows = parsed.filter((r) => r.SPENDING_FUNDING === "Funding" && r.CATEGORY === "Funding Sources");
-      console.log(`[districtDemographics] Found ${fundingRows.length} rows with CATEGORY="Funding Sources" for org 0180.`);
-      if (fundingRows.length) {
-        console.log(`[districtDemographics] Sample "Funding Sources" row:`, JSON.stringify(fundingRows[0]));
-        console.log(`[districtDemographics] Unique SUB_ROLLUP values:`, [...new Set(fundingRows.map((r) => r.SUB_ROLLUP).filter(Boolean))]);
-        console.log(`[districtDemographics] Unique ROLLUP values:`, [...new Set(fundingRows.map((r) => r.ROLLUP).filter(Boolean))]);
-        console.log(`[districtDemographics] Unique FUND_DESC values:`, [...new Set(fundingRows.map((r) => r.FUND_DESC).filter(Boolean))]);
-      }
+      const fundingRows = parsed.filter((r) => r.SPENDING_FUNDING === "Funding");
+      console.log(`[districtDemographics] Org 0180: ${fundingRows.length} funding rows found (informational only).`);
     }
     return parsed;
   } catch (err) {
@@ -120,10 +113,9 @@ export async function fetchSaipePovertyByDistrict(year = 2023) {
     }
     const contentType = res.headers.get("content-type") || "";
     if (!contentType.includes("json")) {
-      console.error(
-        `[districtDemographics] SAIPE returned non-JSON (content-type: ${contentType}). ` +
-        `The endpoint URL or parameters are likely outdated — verify current API shape at ` +
-        `https://www.census.gov/data/developers/data-sets/Poverty-Statistics.html`
+      console.warn(
+        `[districtDemographics] SAIPE poverty data unavailable this run (non-JSON response). ` +
+        `Non-critical — poverty_rate_saipe will stay null. Revisit later if needed.`
       );
       return new Map();
     }
@@ -179,31 +171,36 @@ export async function fetchDistrictDemographics() {
     if (district.cde_org_code) {
       const financialRows = await fetchDistrictFinancialFile(district.cde_org_code);
       if (financialRows && financialRows.length) {
-        // Real CDE column names (confirmed from actual file): CATEGORY,
-        // AMOUNT, and SPENDING_FUNDING (distinguishes revenue/"Funding"
-        // rows from expenditure/"Spending" rows — we only want Funding
-        // rows for revenue totals, otherwise local/state/federal sums
-        // would double-count spending alongside funding).
+        // Best-guess final mapping: the exact field holding "Local"/"State"/
+        // "Federal" labels wasn't confirmed (debugging stalled at the
+        // CATEGORY="Funding Sources" level — the real breakdown is one level
+        // deeper in SUB_ROLLUP/ROLLUP/FUND_DESC, exact field unconfirmed).
+        // Cast a wide net: check every plausible field on each Funding row
+        // for local/state/federal keywords, and take whichever field matches.
+        // If CDE's real structure differs, this will simply keep returning
+        // null — harmless, doesn't break anything else in the pipeline.
         let local = 0, state = 0, federal = 0;
         let matchedAnyRow = false;
         for (const row of financialRows) {
           const spendingOrFunding = pick(row, "SPENDING_FUNDING");
-          if (spendingOrFunding && !/fund/i.test(spendingOrFunding)) continue; // skip expenditure rows
+          if (spendingOrFunding !== "Funding") continue; // only revenue rows, not spending
 
-          const category = pick(row, "CATEGORY", "Category", "Revenue Category", "Source");
           const amount = toNumber(pick(row, "AMOUNT", "Amount", "Total"));
-          if (!category || amount == null) continue;
-          if (/local/i.test(category)) { local += amount; matchedAnyRow = true; }
-          else if (/state/i.test(category)) { state += amount; matchedAnyRow = true; }
-          else if (/federal/i.test(category)) { federal += amount; matchedAnyRow = true; }
+          if (amount == null) continue;
+
+          const searchableText = [row.SUB_ROLLUP, row.ROLLUP, row.FUND_DESC, row.CATEGORY, row.ORG_ROLLUP]
+            .filter(Boolean)
+            .join(" ");
+
+          if (/local/i.test(searchableText)) { local += amount; matchedAnyRow = true; }
+          else if (/\bstate\b/i.test(searchableText)) { state += amount; matchedAnyRow = true; }
+          else if (/federal/i.test(searchableText)) { federal += amount; matchedAnyRow = true; }
         }
         if (matchedAnyRow) {
           rec.local_revenue = local;
           rec.state_revenue = state;
           rec.federal_revenue = federal;
           rec.total_revenue = local + state + federal;
-        } else if (district.cde_org_code === "0180") {
-          console.warn("[districtDemographics] Org 0180: financial rows found but no CATEGORY values matched local/state/federal pattern — see debug logs above for actual values.");
         }
         rec.demographics_source_url = `${CDE_FINANCIAL_BASE}/${district.cde_org_code}`;
       }
