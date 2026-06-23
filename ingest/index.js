@@ -10,6 +10,20 @@ const args = process.argv.slice(2);
 const sourceArg = args.find((a) => a.startsWith("--source="));
 const source = sourceArg ? sourceArg.split("=")[1] : "all";
 
+async function runDemographics() {
+  const runId = await startRun("district-demographics");
+  try {
+    console.log("Fetching district demographic/financial data from CDE...");
+    const rows = await fetchDistrictDemographics();
+    console.log(`Found demographic data for ${rows.length} districts.`);
+    const { updated, failed } = await upsertDistrictDemographics(rows);
+    await finishRun(runId, { found: rows.length, updated, failed, status: failed ? "partial" : "success" });
+    console.log(`Demographics: updated ${updated}, failed ${failed}.`);
+  } catch (err) {
+    console.error("Demographics run failed:", err);
+    await finishRun(runId, { status: "failed", errorLog: { message: err.message } });
+  }
+}
 async function runDistricts() {
   const runId = await startRun("districts");
   try {
@@ -94,3 +108,4 @@ main().catch((err) => {
   console.error("Fatal pipeline error:", err);
   process.exit(1);
 });
+if (source === "demographics" || source === "all") await runDemographics();
