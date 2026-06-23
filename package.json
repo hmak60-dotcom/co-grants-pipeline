@@ -7,6 +7,7 @@
   "scripts": {
     "ingest:all": "node ingest/index.js --source=all",
     "ingest:districts": "node ingest/index.js --source=districts",
+    "ingest:demographics": "node ingest/index.js --source=demographics",
     "ingest:grants-gov": "node ingest/index.js --source=grants-gov",
     "ingest:cde": "node ingest/index.js --source=cde"
   },
@@ -17,7 +18,7 @@
     "node-fetch": "^3.3.2",
     "playwright": "^1.47.0",
     "csv-parse": "^5.5.6",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
     "xlsx": "^0.18.5"
   }
 }
