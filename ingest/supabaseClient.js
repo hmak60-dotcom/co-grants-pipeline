@@ -45,14 +45,17 @@ export async function upsertGrants(grantRows) {
 }
 
 /**
- * Upsert a batch of district rows, deduped on nces_district_id.
+ * Upsert a batch of district rows, deduped on cde_org_code.
+ * (Switched from nces_district_id since CDE's directory — our primary
+ * district source — doesn't always carry an NCES ID; cde_org_code is
+ * reliably present on every row from that source.)
  */
 export async function upsertDistricts(districtRows) {
   if (!districtRows.length) return { inserted: 0, failed: 0 };
 
   const { data, error } = await supabase
     .from("districts")
-    .upsert(districtRows, { onConflict: "nces_district_id", ignoreDuplicates: false })
+    .upsert(districtRows, { onConflict: "cde_org_code", ignoreDuplicates: false })
     .select("id");
 
   if (error) {
