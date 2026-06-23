@@ -153,7 +153,7 @@ export async function fetchSaipePovertyByDistrict(year = 2023) {
     }
     const contentType = res.headers.get("content-type") || "";
     if (!contentType.includes("json")) {
-      console.warn("[districtDemographics] SAIPE poverty data unavailable this run (non-JSON response).");
+      console.warn("[districtDemographics] SAIPE poverty data unavailable this run.");
       return new Map();
     }
     const json = await res.json();
@@ -188,13 +188,29 @@ async function getExistingDistricts() {
 export async function fetchDistrictDemographics() {
   const districts = await getExistingDistricts();
   if (!districts.length) {
-    console.warn("[districtDemographics] No districts found in Supabase yet — run districts ingestion first.");
+    console.warn("[districtDemographics] No districts found in Supabase yet.");
     return [];
   }
 
   const saipeMap = await fetchSaipePovertyByDistrict();
   const instructionalMap = await fetchInstructionalProgramCounts();
   console.log("[districtDemographics] Sample district.cde_org_code values from Supabase:", districts.slice(0, 5).map((d) => d.cde_org_code));
+
+  if (districts.length) {
+    const testCode = districts[0].cde_org_code;
+    const normalized = normalizeOrgCode(testCode);
+    console.log(`[districtDemographics] DIAGNOSTIC — testing district "${districts[0].name}":`);
+    console.log(`  raw cde_org_code: ${JSON.stringify(testCode)}, char codes:`, Array.from(testCode).map((c) => c.charCodeAt(0)));
+    console.log(`  normalized: ${JSON.stringify(normalized)}, char codes:`, Array.from(normalized).map((c) => c.charCodeAt(0)));
+    console.log(`  instructionalMap.has(normalized): ${instructionalMap.has(normalized)}`);
+    const mapKeysArray = Array.from(instructionalMap.keys());
+    console.log(`  Total keys in instructionalMap: ${mapKeysArray.length}`);
+    if (mapKeysArray.length) {
+      console.log(`  First map key: ${JSON.stringify(mapKeysArray[0])}, char codes:`, Array.from(mapKeysArray[0]).map((c) => c.charCodeAt(0)));
+      console.log(`  Does map contain exact match anywhere?`, mapKeysArray.includes(normalized));
+    }
+  }
+
   const results = [];
 
   for (const district of districts) {
