@@ -47,16 +47,14 @@ function toNumber(val) {
   return Number.isFinite(n) ? n : null;
 }
 
+function normalizeOrgCode(code) {
+  if (code === null || code === undefined || code === "") return null;
+  const digitsOnly = String(code).trim().replace(/\D/g, "");
+  return digitsOnly.padStart(4, "0");
+}
+
 const CDE_INSTRUCTIONAL_PROGRAMS_URL = process.env.CDE_INSTRUCTIONAL_PROGRAMS_URL || null;
 
-/**
- * This file is MULTI-SHEET (confirmed from a real downloaded copy, June 2026):
- *   - "FRL_K12" sheet: Free/Reduced Lunch counts + percentages per district
- *   - "IPST" sheet: Special Education, Multilingual Learner (EL), Gifted and
- *     Talented, Homeless, Section 504, Immigrant, Migrant counts + percentages
- * Each sheet has 2 title rows above the real header row (row 3), and a
- * "Statewide Total" row right after the header that we skip (org code "-").
- */
 function parseNamedSheet(workbook, sheetName) {
   const sheet = workbook.Sheets[sheetName];
   if (!sheet) {
@@ -80,10 +78,7 @@ function parseNamedSheet(workbook, sheetName) {
 
 export async function fetchInstructionalProgramCounts() {
   if (!CDE_INSTRUCTIONAL_PROGRAMS_URL) {
-    console.warn(
-      "[districtDemographics] CDE_INSTRUCTIONAL_PROGRAMS_URL not set — FRL/ELL/SPED/Gifted " +
-      "counts will stay null."
-    );
+    console.warn("[districtDemographics] CDE_INSTRUCTIONAL_PROGRAMS_URL not set.");
     return new Map();
   }
 
@@ -109,7 +104,8 @@ export async function fetchInstructionalProgramCounts() {
     const map = new Map();
 
     for (const row of frlRows) {
-      const orgCode = String(row["Organization Code"]).trim();
+      const orgCode = normalizeOrgCode(row["Organization Code"]);
+      if (!orgCode) continue;
       if (!map.has(orgCode)) map.set(orgCode, {});
       const rec = map.get(orgCode);
       rec.frl_count = toNumber(row["Free and Reduced\nCount"]);
@@ -118,7 +114,8 @@ export async function fetchInstructionalProgramCounts() {
     }
 
     for (const row of ipstRows) {
-      const orgCode = String(row["Organization Code"]).trim();
+      const orgCode = normalizeOrgCode(row["Organization Code"]);
+      if (!orgCode) continue;
       if (!map.has(orgCode)) map.set(orgCode, {});
       const rec = map.get(orgCode);
       rec.special_education_count = toNumber(row["Special Education \nCount"]);
@@ -134,6 +131,8 @@ export async function fetchInstructionalProgramCounts() {
       if (giftedPercent != null) rec.gifted_rate = Math.round(giftedPercent * 1000) / 10;
     }
 
+    console.log("[districtDemographics] Sample normalized FRL/IPST map keys:", Array.from(map.keys()).slice(0, 5));
+
     return map;
   } catch (err) {
     console.error("[districtDemographics] Instructional programs fetch error:", err.message);
@@ -144,9 +143,7 @@ export async function fetchInstructionalProgramCounts() {
 export async function fetchSaipePovertyByDistrict(year = 2023) {
   const apiKey = process.env.CENSUS_API_KEY || "";
   const keyParam = apiKey ? `&key=${apiKey}` : "";
-  if (!apiKey) {
-    console.warn("[districtDemographics] No CENSUS_API_KEY set.");
-  }
+  if (!apiKey) console.warn("[districtDemographics] No CENSUS_API_KEY set.");
   const url = `${SAIPE_API_BASE}?get=SD_NAME,SAEPOVRT5_17R_PT&for=school%20district%20(unified):*&in=state:08&YEAR=${year}${keyParam}`;
   try {
     const res = await fetch(url);
@@ -197,6 +194,7 @@ export async function fetchDistrictDemographics() {
 
   const saipeMap = await fetchSaipePovertyByDistrict();
   const instructionalMap = await fetchInstructionalProgramCounts();
+  console.log("[districtDemographics] Sample district.cde_org_code values from Supabase:", districts.slice(0, 5).map((d) => d.cde_org_code));
   const results = [];
 
   for (const district of districts) {
@@ -248,8 +246,8 @@ export async function fetchDistrictDemographics() {
       rec.poverty_rate_saipe = saipeMap.get(district.nces_district_id).povertyRate;
     }
 
-    if (district.cde_org_code && instructionalMap.has(district.cde_org_code)) {
-      const inst = instructionalMap.get(district.cde_org_code);
+    if (district.cde_org_code && instructionalMap.has(normalizeOrgCode(district.cde_org_code))) {
+      const inst = instructionalMap.get(normalizeOrgCode(district.cde_org_code));
       Object.assign(rec, inst);
       const enrollment = rec.total_enrollment;
       if (enrollment) {
@@ -273,13 +271,17 @@ export async function upsertDistrictDemographics(demographicRows) {
   for (const row of demographicRows) {
     if (!row.cde_org_code) continue;
 
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from("districts")
       .update({ ...row, demographics_updated_at: new Date().toISOString() })
-      .eq("cde_org_code", row.cde_org_code);
+      .eq("cde_org_code", row.cde_org_code)
+      .select("cde_org_code");
 
     if (error) {
       console.error(`Failed to update demographics for org code ${row.cde_org_code}:`, error.message);
+      failed++;
+    } else if (!data || data.length === 0) {
+      console.warn(`[districtDemographics] No district row matched cde_org_code "${row.cde_org_code}" — update silently affected 0 rows.`);
       failed++;
     } else {
       updated++;
