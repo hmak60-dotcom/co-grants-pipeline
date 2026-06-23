@@ -28,7 +28,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CANDID_API_KEY: ${{ secrets.CANDID_API_KEY }}
-        run: node ingest/index.js --source=all
+          CDE_DISTRICT_DIRECTORY_URL: ${{ secrets.CDE_DISTRICT_DIRECTORY_URL }}
 
       - name: Upload debug screenshot on failure
         if: failure()
