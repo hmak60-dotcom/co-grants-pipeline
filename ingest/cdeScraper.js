@@ -19,7 +19,11 @@ export async function scrapeCdeForecast() {
   const results = [];
 
   try {
-    await page.goto(CDE_FORECAST_URL, { waitUntil: "networkidle", timeout: 30000 });
+    await page.goto(CDE_FORECAST_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+    // Give dynamically-rendered content (if any) a moment to settle, without
+    // waiting for full network idle — CDE's page has ongoing background
+    // requests (analytics, etc.) that never let "networkidle" resolve.
+    await page.waitForTimeout(2000);
 
     // Defensive: take a screenshot for debugging if structure ever shifts
     await page.screenshot({ path: "ingest/_debug_cde_forecast.png", fullPage: true }).catch(() => {});
@@ -76,7 +80,8 @@ export async function scrapeCdeProgramDetail(url) {
   const page = await browser.newPage();
 
   try {
-    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForTimeout(1500);
     const text = await page.evaluate(() => document.querySelector("main")?.innerText || document.body.innerText);
     return { url, rawText: text };
   } catch (err) {
