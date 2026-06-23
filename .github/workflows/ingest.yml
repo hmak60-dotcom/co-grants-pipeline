@@ -29,6 +29,8 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CANDID_API_KEY: ${{ secrets.CANDID_API_KEY }}
           CDE_DISTRICT_DIRECTORY_URL: ${{ secrets.CDE_DISTRICT_DIRECTORY_URL }}
+          CDE_INSTRUCTIONAL_PROGRAMS_URL: ${{ secrets.CDE_INSTRUCTIONAL_PROGRAMS_URL }}
+          CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
         run: node ingest/index.js --source=all
 
       - name: Upload debug screenshot on failure
