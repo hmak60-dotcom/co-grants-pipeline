@@ -1,4 +1,5 @@
 import { fetchAllColoradoDistricts } from "./districts.js";
+import { fetchDistrictDemographics, upsertDistrictDemographics } from "./districtDemographics.js";
 import { fetchGrantsGovFull } from "./grantsGov.js";
 import { scrapeCdeFull } from "./cdeScraper.js";
 import { fetchCandidEducationGrants } from "./candidClient.js";
