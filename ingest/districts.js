@@ -32,7 +32,38 @@ async function downloadXlsx(url) {
   const buffer = await res.arrayBuffer();
   const workbook = XLSX.read(buffer, { type: "buffer" });
   const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-  return XLSX.utils.sheet_to_json(firstSheet, { defval: null });
+
+  // CDE's exports often have a title row (e.g. "Page: 1" or a report title)
+  // ABOVE the real header row, which throws off naive sheet_to_json parsing
+  // (you get __EMPTY, __EMPTY_1, etc. as "headers"). Read as raw arrays
+  // first, find the row that actually looks like headers, then re-parse
+  // using that row as the header.
+  const rawRows = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: null });
+
+  const headerRowIndex = rawRows.findIndex((row) => {
+    const nonEmptyCells = row.filter((c) => c !== null && c !== "");
+    // A real header row should have several short text cells (column names),
+    // not a single title string or mostly-empty row.
+    return nonEmptyCells.length >= 3 && nonEmptyCells.every((c) => typeof c === "string" && c.length < 60);
+  });
+
+  if (headerRowIndex === -1) {
+    console.warn("[downloadXlsx] Could not auto-detect header row — falling back to row 0.");
+    return XLSX.utils.sheet_to_json(firstSheet, { defval: null });
+  }
+
+  const headers = rawRows[headerRowIndex];
+  const dataRows = rawRows.slice(headerRowIndex + 1);
+
+  return dataRows
+    .filter((row) => row.some((c) => c !== null && c !== ""))
+    .map((row) => {
+      const obj = {};
+      headers.forEach((h, i) => {
+        if (h) obj[h] = row[i] ?? null;
+      });
+      return obj;
+    });
 }
 
 export async function fetchColoradoDistrictsFromCDE() {
@@ -46,6 +77,9 @@ export async function fetchColoradoDistrictsFromCDE() {
   }
 
   const rows = await downloadXlsx(CDE_DISTRICT_DIRECTORY_URL);
+  if (rows.length) {
+    console.log("[districts] Detected columns:", Object.keys(rows[0]));
+  }
 
   // This file typically includes BOTH district-level and school-level rows.
   // Filter down to district/BOCES-level entries only — adjust the filter
@@ -58,19 +92,23 @@ export async function fetchColoradoDistrictsFromCDE() {
     return !schoolName || (orgType && /district|boces/i.test(orgType));
   });
 
-  return districtRows.map((r) => ({
-    cde_org_code: pick(r, "Org Code", "District Code", "Organization Code"),
-    name: pick(r, "District Name", "Organization Name", "LEA Name"),
-    county: pick(r, "County", "County Name"),
-    district_type: pick(r, "Org Type", "Organization Type") || "School District",
-    address: pick(r, "Address", "Street Address", "Mailing Address"),
-    city: pick(r, "City"),
-    state: "CO",
-    zip: pick(r, "Zip", "Zip Code"),
-    phone: pick(r, "Phone", "Phone Number"),
-    website: pick(r, "Website", "URL"),
-    raw_source_payload: r,
-  }));
+  return districtRows
+    .map((r) => ({
+      cde_org_code: pick(r, "Org Code", "District Code", "Organization Code"),
+      name: pick(r, "District Name", "Organization Name", "LEA Name"),
+      county: pick(r, "County", "County Name"),
+      district_type: pick(r, "Org Type", "Organization Type") || "School District",
+      address: pick(r, "Address", "Street Address", "Mailing Address"),
+      city: pick(r, "City"),
+      state: "CO",
+      zip: pick(r, "Zip", "Zip Code"),
+      phone: pick(r, "Phone", "Phone Number"),
+      website: pick(r, "Website", "URL"),
+      raw_source_payload: r,
+    }))
+    // Guard against the not-null constraint on `name` — drop any row where
+    // we couldn't find a name under any of the candidate column headers.
+    .filter((d) => d.name);
 }
 
 /**
