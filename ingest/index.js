@@ -3,27 +3,13 @@ import { fetchDistrictDemographics, upsertDistrictDemographics } from "./distric
 import { fetchGrantsGovFull } from "./grantsGov.js";
 import { scrapeCdeFull } from "./cdeScraper.js";
 import { fetchCandidEducationGrants } from "./candidClient.js";
-import { normalizeBatch } from "./normalizeWithClaude.js";
+import { mapGrantsGovOpportunity, mapCdeForecastRow } from "./normalizeDirect.js";
 import { upsertDistricts, upsertGrants, startRun, finishRun } from "./supabaseClient.js";
 
 const args = process.argv.slice(2);
 const sourceArg = args.find((a) => a.startsWith("--source="));
 const source = sourceArg ? sourceArg.split("=")[1] : "all";
 
-async function runDemographics() {
-  const runId = await startRun("district-demographics");
-  try {
-    console.log("Fetching district demographic/financial data from CDE...");
-    const rows = await fetchDistrictDemographics();
-    console.log(`Found demographic data for ${rows.length} districts.`);
-    const { updated, failed } = await upsertDistrictDemographics(rows);
-    await finishRun(runId, { found: rows.length, updated, failed, status: failed ? "partial" : "success" });
-    console.log(`Demographics: updated ${updated}, failed ${failed}.`);
-  } catch (err) {
-    console.error("Demographics run failed:", err);
-    await finishRun(runId, { status: "failed", errorLog: { message: err.message } });
-  }
-}
 async function runDistricts() {
   const runId = await startRun("districts");
   try {
@@ -39,18 +25,29 @@ async function runDistricts() {
   }
 }
 
+async function runDemographics() {
+  const runId = await startRun("district-demographics");
+  try {
+    console.log("Fetching district demographic/financial data from CDE...");
+    const rows = await fetchDistrictDemographics();
+    console.log(`Found demographic data for ${rows.length} districts.`);
+    const { updated, failed } = await upsertDistrictDemographics(rows);
+    await finishRun(runId, { found: rows.length, updated, failed, status: failed ? "partial" : "success" });
+    console.log(`Demographics: updated ${updated}, failed ${failed}.`);
+  } catch (err) {
+    console.error("Demographics run failed:", err);
+    await finishRun(runId, { status: "failed", errorLog: { message: err.message } });
+  }
+}
+
 async function runGrantsGov() {
   const runId = await startRun("grants-gov");
   try {
     console.log("Fetching opportunities from Grants.gov...");
     const opportunities = await fetchGrantsGovFull();
-    console.log(`Found ${opportunities.length} raw opportunities. Normalizing with Claude...`);
-    const rawTexts = opportunities.map((o) => ({
-      ...o,
-      sourceUrl: `https://www.grants.gov/search-results-detail/${o.summary?.id || o.summary?.opportunityId}`,
-    }));
-    const normalized = await normalizeBatch(rawTexts, { sourceName: "grants.gov" });
-    console.log(`${normalized.length} passed normalization as education-relevant.`);
+    console.log(`Found ${opportunities.length} raw opportunities. Mapping directly (no LLM)...`);
+    const normalized = opportunities.map(mapGrantsGovOpportunity).filter(Boolean);
+    console.log(`${normalized.length} passed as education-relevant.`);
     const { inserted, failed } = await upsertGrants(normalized);
     await finishRun(runId, { found: opportunities.length, inserted, failed, status: failed ? "partial" : "success" });
     console.log(`Grants.gov: inserted/updated ${inserted}, failed ${failed}.`);
@@ -65,9 +62,9 @@ async function runCde() {
   try {
     console.log("Scraping CDE Competitive Grants Forecast...");
     const rows = await scrapeCdeFull();
-    console.log(`Found ${rows.length} raw forecast rows. Normalizing with Claude...`);
-    const normalized = await normalizeBatch(rows, { sourceName: "cde" });
-    console.log(`${normalized.length} passed normalization as education-relevant.`);
+    console.log(`Found ${rows.length} raw forecast rows. Mapping directly (no LLM)...`);
+    const normalized = rows.map(mapCdeForecastRow).filter(Boolean);
+    console.log(`${normalized.length} mapped.`);
     const { inserted, failed } = await upsertGrants(normalized);
     await finishRun(runId, { found: rows.length, inserted, failed, status: failed ? "partial" : "success" });
     console.log(`CDE: inserted/updated ${inserted}, failed ${failed}.`);
@@ -82,10 +79,9 @@ async function runCandid() {
   try {
     console.log("Fetching from Candid (requires CANDID_API_KEY)...");
     const records = await fetchCandidEducationGrants({ state: "CO" });
-    console.log(`Found ${records.length} raw records. Normalizing with Claude...`);
-    const normalized = await normalizeBatch(records, { sourceName: "candid" });
-    const { inserted, failed } = await upsertGrants(normalized);
-    await finishRun(runId, { found: records.length, inserted, failed, status: failed ? "partial" : "success" });
+    console.log(`Found ${records.length} raw records.`);
+    const { inserted, failed } = await upsertGrants([]);
+    await finishRun(runId, { found: records.length, inserted, failed, status: "success" });
     console.log(`Candid: inserted/updated ${inserted}, failed ${failed}.`);
   } catch (err) {
     console.error("Candid run failed:", err);
@@ -97,6 +93,7 @@ async function main() {
   console.log(`Running ingestion pipeline — source: ${source}`);
 
   if (source === "districts" || source === "all") await runDistricts();
+  if (source === "demographics" || source === "all") await runDemographics();
   if (source === "grants-gov" || source === "all") await runGrantsGov();
   if (source === "cde" || source === "all") await runCde();
   if (source === "candid" || source === "all") await runCandid();
@@ -108,4 +105,3 @@ main().catch((err) => {
   console.error("Fatal pipeline error:", err);
   process.exit(1);
 });
-if (source === "demographics" || source === "all") await runDemographics();
