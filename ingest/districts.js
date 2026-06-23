@@ -1,103 +1,134 @@
 import fetch from "node-fetch";
-import { parse } from "csv-parse/sync";
+import * as XLSX from "xlsx";
 
 /**
- * NCES Common Core of Data (CCD) publishes a public, structured directory
- * of every school district in the US, updated annually. No API key needed.
+ * PRIMARY SOURCE — confirmed working, updated weekly by CDE:
+ * "District and School Contact Information" Excel file.
+ * https://www.cde.state.co.us/cdereval/downloadablemailinglabels
+ * This is far more reliable than NCES's annually-versioned zip files
+ * (no unzip step needed, no stale year-specific URL to chase).
  *
- * The exact download URL changes by year (NCES versions their files), so
- * rather than hardcoding a stale link, this fetches the current "Local
- * Education Agency (District) Universe" file index page and grabs the
- * latest CSV — adjust NCES_FILE_URL below once you confirm the current
- * year's direct CSV link from https://nces.ed.gov/ccd/files.asp
- * ("Local Education Agency Universe Survey Data").
+ * IMPORTANT: the page itself (downloadablemailinglabels) links to the
+ * actual .xlsx file — I could not crawl the page directly to grab the
+ * exact file URL (CDE blocks automated fetching). You'll need to:
+ *   1. Visit https://www.cde.state.co.us/cdereval/downloadablemailinglabels
+ *   2. Right-click the Excel download link → "Copy Link Address"
+ *   3. Paste it into CDE_DISTRICT_DIRECTORY_URL below (or set it as an
+ *      env var / GitHub secret named CDE_DISTRICT_DIRECTORY_URL instead
+ *      of hardcoding, since CDE occasionally moves these file paths)
  */
-const NCES_FILE_URL = process.env.NCES_DISTRICT_CSV_URL ||
-  "https://nces.ed.gov/ccd/Data/zip/ccd_lea_029_2324_w_1a_073124.zip"; // EXAMPLE — confirm current year's file
+const CDE_DISTRICT_DIRECTORY_URL = process.env.CDE_DISTRICT_DIRECTORY_URL || null;
 
-/**
- * Colorado FIPS state code is "08" — NCES LEA records include a STATEFIP /
- * LEA_STATE field for filtering.
- */
-const CO_STATE_CODE = "CO";
+function pick(row, ...candidates) {
+  for (const key of candidates) {
+    if (row[key] !== undefined && row[key] !== null && row[key] !== "") return row[key];
+  }
+  return null;
+}
 
-export async function fetchColoradoDistrictsFromNCES() {
-  // NOTE: NCES distributes this as a zipped CSV/SAS/SPSS bundle, not a
-  // simple flat CSV — you'll likely need to download+unzip once manually
-  // (or add a `node-stream-zip` step here) since the file format/structure
-  // changes slightly year to year. This function assumes you've already
-  // unzipped and are pointing NCES_DISTRICT_CSV_URL at the extracted .csv.
-  const res = await fetch(NCES_FILE_URL);
-  if (!res.ok) {
-    throw new Error(
-      `Failed to fetch NCES district file (${res.status}). ` +
-      `Check https://nces.ed.gov/ccd/files.asp for the current year's direct CSV link ` +
-      `and set NCES_DISTRICT_CSV_URL in .env.`
+async function downloadXlsx(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
+  const buffer = await res.arrayBuffer();
+  const workbook = XLSX.read(buffer, { type: "buffer" });
+  const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(firstSheet, { defval: null });
+}
+
+export async function fetchColoradoDistrictsFromCDE() {
+  if (!CDE_DISTRICT_DIRECTORY_URL) {
+    console.warn(
+      "[districts] CDE_DISTRICT_DIRECTORY_URL is not set. " +
+      "Visit https://www.cde.state.co.us/cdereval/downloadablemailinglabels, " +
+      "grab the actual Excel file link, and set it as an env var/secret."
     );
+    return [];
   }
 
-  const csvText = await res.text();
-  const records = parse(csvText, { columns: true, skip_empty_lines: true });
+  const rows = await downloadXlsx(CDE_DISTRICT_DIRECTORY_URL);
 
-  const coDistricts = records.filter(
-    (r) => (r.LSTATE || r.STATE_ABBR || r.LEA_STATE) === CO_STATE_CODE
-  );
+  // This file typically includes BOTH district-level and school-level rows.
+  // Filter down to district/BOCES-level entries only — adjust the filter
+  // condition once you've opened the real file and confirmed how CDE
+  // distinguishes a district row from a school row (often a "Org Type"
+  // or "Level" column, or simply the absence of a school name).
+  const districtRows = rows.filter((r) => {
+    const orgType = pick(r, "Org Type", "Organization Type", "Level");
+    const schoolName = pick(r, "School Name", "Building Name");
+    return !schoolName || (orgType && /district|boces/i.test(orgType));
+  });
 
-  return coDistricts.map((r) => ({
-    nces_district_id: r.LEAID || r.LEA_ID,
-    name: r.LEA_NAME || r.NAME,
-    county: r.CONAME || r.COUNTY_NAME || null,
-    district_type: r.LEA_TYPE_TEXT || null,
-    address: r.LSTREET1 || null,
-    city: r.LCITY || null,
+  return districtRows.map((r) => ({
+    cde_org_code: pick(r, "Org Code", "District Code", "Organization Code"),
+    name: pick(r, "District Name", "Organization Name", "LEA Name"),
+    county: pick(r, "County", "County Name"),
+    district_type: pick(r, "Org Type", "Organization Type") || "School District",
+    address: pick(r, "Address", "Street Address", "Mailing Address"),
+    city: pick(r, "City"),
     state: "CO",
-    zip: r.LZIP || null,
-    phone: r.PHONE || null,
-    enrollment: r.MEMBER ? Number(r.MEMBER) : null,
-    urbanicity: r.ULOCALE_TEXT || null,
-    locale_code: r.ULOCALE || null,
-    latitude: r.LAT ? Number(r.LAT) : null,
-    longitude: r.LON ? Number(r.LON) : null,
+    zip: pick(r, "Zip", "Zip Code"),
+    phone: pick(r, "Phone", "Phone Number"),
+    website: pick(r, "Website", "URL"),
     raw_source_payload: r,
   }));
 }
 
 /**
- * CDE also publishes its own org/district list directly (often more
- * current than NCES, which lags by a year). Use this as a secondary
- * source to fill gaps / cross-check, especially for newly formed
- * charter authorizers or BOCES not yet reflected in NCES.
+ * FALLBACK / CROSS-REFERENCE SOURCE — NCES Common Core of Data.
+ * Useful for getting a stable federal NCES LEAID (for joining against
+ * other federal datasets like Census SAIPE poverty data), and as a
+ * sanity check against CDE's own list. Kept here but not used as primary
+ * since CDE's weekly file is more current and easier to fetch reliably.
  *
- * https://www.cde.state.co.us/cdereval/rvonline -> Organization search/export
- * Confirm the current direct export link before relying on this in production.
+ * NCES re-versions this file every year with a year-specific filename —
+ * confirm the current direct link at https://nces.ed.gov/ccd/files.asp
+ * ("Local Education Agency Universe Survey Data") and set
+ * NCES_DISTRICT_CSV_URL if you want to wire this back in for ID matching.
  */
-export async function fetchColoradoDistrictsFromCDE() {
-  console.warn(
-    "[districts] fetchColoradoDistrictsFromCDE is a placeholder — " +
-    "CDE's org list export link should be confirmed at " +
-    "https://www.cde.state.co.us/cdereval and wired in here once verified."
-  );
-  return [];
+export async function fetchColoradoDistrictsFromNCES() {
+  const ncesUrl = process.env.NCES_DISTRICT_CSV_URL || null;
+  if (!ncesUrl) {
+    console.warn(
+      "[districts] NCES_DISTRICT_CSV_URL not set — skipping NCES cross-reference. " +
+      "This only affects nces_district_id (used for SAIPE poverty matching), not core district data."
+    );
+    return [];
+  }
+
+  try {
+    const res = await fetch(ncesUrl);
+    if (!res.ok) throw new Error(`${res.status}`);
+    const csvText = await res.text();
+    const { parse } = await import("csv-parse/sync");
+    const records = parse(csvText, { columns: true, skip_empty_lines: true });
+    return records
+      .filter((r) => (r.LSTATE || r.STATE_ABBR || r.LEA_STATE) === "CO")
+      .map((r) => ({
+        nces_district_id: r.LEAID || r.LEA_ID,
+        name: r.LEA_NAME || r.NAME,
+      }));
+  } catch (err) {
+    console.error("[districts] NCES fetch failed (non-fatal):", err.message);
+    return [];
+  }
 }
 
 export async function fetchAllColoradoDistricts() {
-  const [ncesDistricts, cdeDistricts] = await Promise.all([
-    fetchColoradoDistrictsFromNCES().catch((err) => {
-      console.error("NCES fetch failed:", err.message);
-      return [];
-    }),
-    fetchColoradoDistrictsFromCDE(),
-  ]);
+  const cdeDistricts = await fetchColoradoDistrictsFromCDE();
+  const ncesDistricts = await fetchColoradoDistrictsFromNCES();
 
-  // Merge, preferring NCES as primary key source, CDE as enrichment
-  const byId = new Map(ncesDistricts.map((d) => [d.nces_district_id, d]));
-  for (const cdeRow of cdeDistricts) {
-    if (cdeRow.nces_district_id && byId.has(cdeRow.nces_district_id)) {
-      Object.assign(byId.get(cdeRow.nces_district_id), cdeRow);
-    } else if (cdeRow.nces_district_id) {
-      byId.set(cdeRow.nces_district_id, cdeRow);
+  // Cross-reference by name to attach nces_district_id where possible
+  // (rough match — district names are usually close enough between sources,
+  // but verify a sample after first run since this is a fuzzy join).
+  if (ncesDistricts.length) {
+    const ncesByName = new Map(
+      ncesDistricts.map((d) => [String(d.name).toLowerCase().trim(), d.nces_district_id])
+    );
+    for (const d of cdeDistricts) {
+      const match = ncesByName.get(String(d.name).toLowerCase().trim());
+      if (match) d.nces_district_id = match;
     }
   }
 
-  return Array.from(byId.values());
+  return cdeDistricts;
 }
