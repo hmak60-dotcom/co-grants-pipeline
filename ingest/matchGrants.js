@@ -89,6 +89,44 @@ const NEED_WEIGHT = 0.7;
 const AMOUNT_WEIGHT = 0.3;
 const MAX_MATCHES_PER_DISTRICT = 30; // store the top N, not all ~600 grants x 181 districts
 
+/**
+ * Checks whether a grant's eligibility text actually allows school districts
+ * to apply, independent of whether its category/focus_area tags look like a
+ * good topical fit. A grant can be perfectly on-topic (e.g. tagged "stem")
+ * while being restricted to universities, individuals, or nonprofits only —
+ * tag overlap alone can't catch that, so we read the real eligibility text.
+ *
+ * Returns a multiplier (0-1) applied to the final match score:
+ *   1.0  = clearly open to districts, or no eligibility text to judge from
+ *   0.1  = eligibility text clearly excludes districts (heavily down-ranked,
+ *          not fully removed, in case the wording is ambiguous in practice)
+ */
+const DISTRICT_POSITIVE_SIGNALS = [
+  "school district", "local education agency", " lea ", "k-12", "k12",
+  "public school", "boces", "charter school", "school board",
+  "public school district", "education agency",
+];
+const NON_DISTRICT_EXCLUSIVE_SIGNALS = [
+  "institutions of higher education", "higher education institution",
+  "college or university", "university only", "universities only",
+  "nonprofit organizations only", "501(c)(3) organizations only",
+  "individual applicants only", "individuals only", "state agencies only",
+  "tribal governments only", "research institutions only",
+];
+
+function eligibilityFitMultiplier(grant) {
+  const text = (grant.eligibility_requirements || "").toLowerCase();
+  if (!text) return 1; // no eligibility text to judge from — stay neutral, don't penalize missing data
+
+  const hasPositive = DISTRICT_POSITIVE_SIGNALS.some((s) => text.includes(s));
+  if (hasPositive) return 1;
+
+  const hasExclusiveNegative = NON_DISTRICT_EXCLUSIVE_SIGNALS.some((s) => text.includes(s));
+  if (hasExclusiveNegative) return 0.1;
+
+  return 1; // ambiguous wording — don't penalize on uncertain signal alone
+}
+
 function computeNeedLevels(district, benchmark) {
   return NEED_DIMENSIONS.map((dim) => ({ ...dim, score: dim.level(district, benchmark) }));
 }
@@ -114,14 +152,19 @@ function computeMatchScore(district, grant, benchmark, maxGrantAmount) {
   const amount = grant.possible_funding_amount || 0;
   const amountComponent = Math.log10(amount + 1) / Math.log10(maxGrantAmount + 1);
 
-  const matchScore = NEED_WEIGHT * needComponent + AMOUNT_WEIGHT * amountComponent;
+  const rawScore = NEED_WEIGHT * needComponent + AMOUNT_WEIGHT * amountComponent;
+  const eligMultiplier = eligibilityFitMultiplier(grant);
+  const matchScore = rawScore * eligMultiplier;
 
   // Build a short, human-readable reason string for transparency
   const matchedDims = levels.filter((dim) => dim.score != null && dim.score >= 2 && dim.tags.some((t) => focusAreas.includes(t)));
   const reasonParts = matchedDims.map((dim) => `${dim.label.toLowerCase()} (${dim.score === 3 ? "high" : "medium"} need)`);
-  const matchReason = reasonParts.length
+  let matchReason = reasonParts.length
     ? `Matches on: ${reasonParts.join(", ")}`
     : "General fit based on grant size; no specific need-area overlap found";
+  if (eligMultiplier < 1) {
+    matchReason += " — CAUTION: eligibility text suggests this may not be open to school districts, verify before applying";
+  }
 
   return { matchScore: Math.round(matchScore * 1000) / 1000, matchReason };
 }
