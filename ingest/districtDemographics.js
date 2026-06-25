@@ -41,6 +41,23 @@ function pick(row, ...candidates) {
   return null;
 }
 
+/**
+ * Whitespace-insensitive field lookup. Found via real debugging (June 2026):
+ * SheetJS (the JS Excel library) preserves \r\n line breaks inside multi-line
+ * header cells exactly as stored in the file, while some other tools quietly
+ * normalize \r\n down to \n. This collapses all whitespace before comparing.
+ */
+function pickFlexible(row, ...targetHeaders) {
+  const normalize = (s) => String(s).replace(/\s+/g, " ").trim().toLowerCase();
+  for (const [key, value] of Object.entries(row)) {
+    const normalizedKey = normalize(key);
+    for (const target of targetHeaders) {
+      if (normalizedKey === normalize(target)) return value;
+    }
+  }
+  return undefined;
+}
+
 function toNumber(val) {
   if (val === null || val === undefined || val === "") return null;
   const n = Number(String(val).replace(/[%,$]/g, ""));
@@ -51,6 +68,29 @@ function normalizeOrgCode(code) {
   if (code === null || code === undefined || code === "") return null;
   const digitsOnly = String(code).trim().replace(/\D/g, "");
   return digitsOnly.padStart(4, "0");
+}
+
+function parseXlsxWithHeaderDetection(buffer) {
+  const workbook = XLSX.read(buffer, { type: "buffer" });
+  const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rawRows = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: null });
+
+  const headerRowIndex = rawRows.findIndex((row) => {
+    const nonEmptyCells = row.filter((c) => c !== null && c !== "");
+    return nonEmptyCells.length >= 3 && nonEmptyCells.every((c) => typeof c === "string" && c.length < 80);
+  });
+
+  if (headerRowIndex === -1) return XLSX.utils.sheet_to_json(firstSheet, { defval: null });
+
+  const headers = rawRows[headerRowIndex];
+  return rawRows
+    .slice(headerRowIndex + 1)
+    .filter((row) => row.some((c) => c !== null && c !== ""))
+    .map((row) => {
+      const obj = {};
+      headers.forEach((h, i) => { if (h) obj[h] = row[i] ?? null; });
+      return obj;
+    });
 }
 
 const CDE_INSTRUCTIONAL_PROGRAMS_URL = process.env.CDE_INSTRUCTIONAL_PROGRAMS_URL || null;
@@ -101,14 +141,6 @@ export async function fetchInstructionalProgramCounts() {
     const ipstRows = parseNamedSheet(workbook, "IPST");
     console.log(`[districtDemographics] Parsed ${frlRows.length} FRL rows and ${ipstRows.length} IPST rows.`);
 
-    const sampleFrlRow = frlRows.find((r) => normalizeOrgCode(r["Organization Code"]) === "0180");
-    if (sampleFrlRow) {
-      console.log("[districtDemographics] Raw FRL_K12 row for org 0180:", JSON.stringify(sampleFrlRow));
-      console.log("[districtDemographics] Exact column keys on that row:", Object.keys(sampleFrlRow).map((k) => JSON.stringify(k)));
-    } else {
-      console.log("[districtDemographics] Could not find a FRL_K12 row for org 0180 during raw inspection.");
-    }
-
     const map = new Map();
 
     for (const row of frlRows) {
@@ -116,8 +148,8 @@ export async function fetchInstructionalProgramCounts() {
       if (!orgCode) continue;
       if (!map.has(orgCode)) map.set(orgCode, {});
       const rec = map.get(orgCode);
-      rec.frl_count = toNumber(row["Free and Reduced\nCount"]);
-      const frlPercent = toNumber(row["Free and Reduced\nPercent"]);
+      rec.frl_count = toNumber(pickFlexible(row, "Free and Reduced\nCount"));
+      const frlPercent = toNumber(pickFlexible(row, "Free and Reduced\nPercent"));
       if (frlPercent != null) rec.frl_rate = Math.round(frlPercent * 1000) / 10;
     }
 
@@ -126,20 +158,21 @@ export async function fetchInstructionalProgramCounts() {
       if (!orgCode) continue;
       if (!map.has(orgCode)) map.set(orgCode, {});
       const rec = map.get(orgCode);
-      rec.special_education_count = toNumber(row["Special Education \nCount"]);
-      const sedPercent = toNumber(row["Special Education\nPercent"]);
+      rec.special_education_count = toNumber(pickFlexible(row, "Special Education\nCount"));
+      const sedPercent = toNumber(pickFlexible(row, "Special Education\nPercent"));
       if (sedPercent != null) rec.special_education_rate = Math.round(sedPercent * 1000) / 10;
 
-      rec.ell_count = toNumber(row["Multilingual Learner: \nNEP, LEP, \nFEP Monitor Year 1 and Monitor Year 2\nCount"]);
-      const ellPercent = toNumber(row["Multilingual Learner: \nNEP, LEP, \nFEP Monitor Year 1 and Monitor Year 2\nPercent"]);
+      rec.ell_count = toNumber(pickFlexible(row, "Multilingual Learner:\nNEP, LEP,\nFEP Monitor Year 1 and Monitor Year 2\nCount"));
+      const ellPercent = toNumber(pickFlexible(row, "Multilingual Learner:\nNEP, LEP,\nFEP Monitor Year 1 and Monitor Year 2\nPercent"));
       if (ellPercent != null) rec.ell_rate = Math.round(ellPercent * 1000) / 10;
 
-      rec.gifted_count = toNumber(row["Gifted and Talented \nCount"]);
-      const giftedPercent = toNumber(row["Gifted and Talented\nPercent"]);
+      rec.gifted_count = toNumber(pickFlexible(row, "Gifted and Talented\nCount"));
+      const giftedPercent = toNumber(pickFlexible(row, "Gifted and Talented\nPercent"));
       if (giftedPercent != null) rec.gifted_rate = Math.round(giftedPercent * 1000) / 10;
     }
 
     console.log("[districtDemographics] Sample normalized FRL/IPST map keys:", Array.from(map.keys()).slice(0, 5));
+    console.log("[districtDemographics] Sample parsed values for org 0180:", JSON.stringify(map.get("0180")));
 
     return map;
   } catch (err) {
@@ -202,24 +235,6 @@ export async function fetchDistrictDemographics() {
 
   const saipeMap = await fetchSaipePovertyByDistrict();
   const instructionalMap = await fetchInstructionalProgramCounts();
-  console.log("[districtDemographics] Sample district.cde_org_code values from Supabase:", districts.slice(0, 5).map((d) => d.cde_org_code));
-
-  if (districts.length) {
-    const testCode = districts[0].cde_org_code;
-    const normalized = normalizeOrgCode(testCode);
-    console.log(`[districtDemographics] DIAGNOSTIC — testing district "${districts[0].name}":`);
-    console.log(`  raw cde_org_code: ${JSON.stringify(testCode)}, char codes:`, Array.from(testCode).map((c) => c.charCodeAt(0)));
-    console.log(`  normalized: ${JSON.stringify(normalized)}, char codes:`, Array.from(normalized).map((c) => c.charCodeAt(0)));
-    console.log(`  instructionalMap.has(normalized): ${instructionalMap.has(normalized)}`);
-    const mapKeysArray = Array.from(instructionalMap.keys());
-    console.log(`  Total keys in instructionalMap: ${mapKeysArray.length}`);
-    if (mapKeysArray.length) {
-      console.log(`  First map key: ${JSON.stringify(mapKeysArray[0])}, char codes:`, Array.from(mapKeysArray[0]).map((c) => c.charCodeAt(0)));
-      console.log(`  Does map contain exact match anywhere?`, mapKeysArray.includes(normalized));
-      console.log(`  Actual stored values for this key:`, JSON.stringify(instructionalMap.get(normalized)));
-    }
-  }
-
   const results = [];
 
   for (const district of districts) {
