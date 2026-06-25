@@ -5,6 +5,7 @@ import { scrapeCdeFull } from "./cdeScraper.js";
 import { fetchCandidEducationGrants } from "./candidClient.js";
 import { mapGrantsGovOpportunity, mapCdeForecastRow } from "./normalizeDirect.js";
 import { upsertDistricts, upsertGrants, startRun, finishRun } from "./supabaseClient.js";
+import { computeAllMatches, upsertMatches } from "./matchGrants.js";
 
 const args = process.argv.slice(2);
 const sourceArg = args.find((a) => a.startsWith("--source="));
@@ -88,6 +89,19 @@ async function runCandid() {
     await finishRun(runId, { status: "failed", errorLog: { message: err.message } });
   }
 }
+async function runMatching() {
+  const runId = await startRun("matching");
+  try {
+    console.log("Computing district-grant matches...");
+    const matchRows = await computeAllMatches();
+    const { inserted, failed } = await upsertMatches(matchRows);
+    await finishRun(runId, { found: matchRows.length, inserted, failed, status: failed ? "partial" : "success" });
+    console.log(`Matching: inserted ${inserted}, failed ${failed}.`);
+  } catch (err) {
+    console.error("Matching run failed:", err);
+    await finishRun(runId, { status: "failed", errorLog: { message: err.message } });
+  }
+}
 
 async function main() {
   console.log(`Running ingestion pipeline — source: ${source}`);
@@ -97,6 +111,7 @@ async function main() {
   if (source === "grants-gov" || source === "all") await runGrantsGov();
   if (source === "cde" || source === "all") await runCde();
   if (source === "candid" || source === "all") await runCandid();
+  if (source === "matching" || source === "all") await runMatching();
 
   console.log("Done.");
 }
