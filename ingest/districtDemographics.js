@@ -101,6 +101,14 @@ export async function fetchInstructionalProgramCounts() {
     const ipstRows = parseNamedSheet(workbook, "IPST");
     console.log(`[districtDemographics] Parsed ${frlRows.length} FRL rows and ${ipstRows.length} IPST rows.`);
 
+    const sampleFrlRow = frlRows.find((r) => normalizeOrgCode(r["Organization Code"]) === "0180");
+    if (sampleFrlRow) {
+      console.log("[districtDemographics] Raw FRL_K12 row for org 0180:", JSON.stringify(sampleFrlRow));
+      console.log("[districtDemographics] Exact column keys on that row:", Object.keys(sampleFrlRow).map((k) => JSON.stringify(k)));
+    } else {
+      console.log("[districtDemographics] Could not find a FRL_K12 row for org 0180 during raw inspection.");
+    }
+
     const map = new Map();
 
     for (const row of frlRows) {
@@ -208,6 +216,7 @@ export async function fetchDistrictDemographics() {
     if (mapKeysArray.length) {
       console.log(`  First map key: ${JSON.stringify(mapKeysArray[0])}, char codes:`, Array.from(mapKeysArray[0]).map((c) => c.charCodeAt(0)));
       console.log(`  Does map contain exact match anywhere?`, mapKeysArray.includes(normalized));
+      console.log(`  Actual stored values for this key:`, JSON.stringify(instructionalMap.get(normalized)));
     }
   }
 
