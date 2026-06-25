@@ -1,5 +1,14 @@
 import { supabase } from "./supabaseClient.js";
 
+/**
+ * Computes a fit score between every district and every active grant, then
+ * stores the results in district_grant_matches. The frontend can then just
+ * query that table directly instead of recomputing this logic in the browser.
+ *
+ * NEED DIMENSIONS — each tied to a real column on `districts` and a set of
+ * real `focus_area` tags used on `grants`. A district's need level (1=Low,
+ * 2=Medium, 3=High) is estimated from public CDE/Census data, not self-reported.
+ */
 const NEED_DIMENSIONS = [
   {
     key: "equity",
@@ -63,21 +72,22 @@ const NEED_DIMENSIONS = [
       if (setting.includes("town")) return 2;
       return 1;
     },
-    {
+  },
+  {
     key: "small",
-    label: "district capacity",
+    label: "District capacity",
     tags: ["workforce", "community_support"],
     level(d) {
       const v = d.total_enrollment;
       if (v == null) return null;
-     return v < 1000 ? 3 : v < 10000 ? 2 : 1;
-   },
+      return v < 1000 ? 3 : v < 10000 ? 2 : 1;
+    },
   },
 ];
 
 const NEED_WEIGHT = 0.7;
 const AMOUNT_WEIGHT = 0.3;
-const MAX_MATCHES_PER_DISTRICT = 30;
+const MAX_MATCHES_PER_DISTRICT = 30; // store the top N, not all ~600 grants x 181 districts
 
 function computeNeedLevels(district, benchmark) {
   return NEED_DIMENSIONS.map((dim) => ({ ...dim, score: dim.level(district, benchmark) }));
@@ -95,7 +105,7 @@ function computeMatchScore(district, grant, benchmark, maxGrantAmount) {
   }
 
   const focusAreas = Array.isArray(grant.focus_area) ? grant.focus_area : [];
-  let needComponent = 0.2;
+  let needComponent = 0.2; // default if no tag overlap data at all
   if (focusAreas.length) {
     const weights = focusAreas.map((tag) => neededTagWeight[tag] || 0);
     needComponent = Math.max(...weights, weights.reduce((s, w) => s + w, 0) / weights.length);
@@ -106,6 +116,7 @@ function computeMatchScore(district, grant, benchmark, maxGrantAmount) {
 
   const matchScore = NEED_WEIGHT * needComponent + AMOUNT_WEIGHT * amountComponent;
 
+  // Build a short, human-readable reason string for transparency
   const matchedDims = levels.filter((dim) => dim.score != null && dim.score >= 2 && dim.tags.some((t) => focusAreas.includes(t)));
   const reasonParts = matchedDims.map((dim) => `${dim.label.toLowerCase()} (${dim.score === 3 ? "high" : "medium"} need)`);
   const matchReason = reasonParts.length
@@ -154,11 +165,14 @@ export async function computeAllMatches() {
 export async function upsertMatches(matchRows) {
   if (!matchRows.length) return { inserted: 0, failed: 0 };
 
+  // Clear old matches first — this is a full recompute each run, not an
+  // incremental update, since match scores can shift if district/grant data changes.
   const { error: deleteError } = await supabase.from("district_grant_matches").delete().neq("id", "00000000-0000-0000-0000-000000000000");
   if (deleteError) {
     console.error("[matchGrants] Failed to clear old matches:", deleteError.message);
   }
 
+  // Insert in batches to avoid one giant request
   const BATCH_SIZE = 500;
   let inserted = 0;
   let failed = 0;
