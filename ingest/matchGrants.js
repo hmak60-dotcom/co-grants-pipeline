@@ -1,1 +1,178 @@
+import { supabase } from "./supabaseClient.js";
 
+const NEED_DIMENSIONS = [
+  {
+    key: "equity",
+    label: "Equity & economic need",
+    tags: ["equity", "community_support"],
+    level(d) {
+      const v = d.frl_rate;
+      if (v == null) return null;
+      return v > 55 ? 3 : v > 30 ? 2 : 1;
+    },
+  },
+  {
+    key: "ell",
+    label: "English language learners",
+    tags: ["ell"],
+    level(d) {
+      const v = d.ell_rate;
+      if (v == null) return null;
+      return v > 25 ? 3 : v > 10 ? 2 : 1;
+    },
+  },
+  {
+    key: "sped",
+    label: "Special education",
+    tags: ["special_education"],
+    level(d) {
+      const v = d.special_education_rate;
+      if (v == null) return null;
+      return v > 15 ? 3 : v > 10 ? 2 : 1;
+    },
+  },
+  {
+    key: "gifted",
+    label: "Gifted & talented capacity",
+    tags: ["equity", "research"],
+    level(d) {
+      const v = d.gifted_rate;
+      if (v == null) return null;
+      return v < 5 ? 3 : v < 10 ? 2 : 1;
+    },
+  },
+  {
+    key: "operating",
+    label: "Operating capacity",
+    tags: ["school_improvement", "community_support"],
+    level(d, benchmark) {
+      const v = d.per_pupil_revenue;
+      if (v == null || !benchmark) return null;
+      const ratio = v / benchmark;
+      return ratio < 0.85 ? 3 : ratio < 1.0 ? 2 : 1;
+    },
+  },
+  {
+    key: "rural",
+    label: "Rural & workforce access",
+    tags: ["workforce", "career_readiness"],
+    level(d) {
+      const setting = (d.districtSetting || "").toLowerCase();
+      if (!setting) return null;
+      if (setting.includes("rural")) return 3;
+      if (setting.includes("town")) return 2;
+      return 1;
+    },
+    {
+    key: "small",
+    label: "district capacity",
+    tags: ["workforce", "community_support"],
+    level(d) {
+      const v = d.total_enrollment;
+      if (v == null) return null;
+     return v < 1000 ? 3 : v < 10000 ? 2 : 1;
+   },
+  },
+];
+
+const NEED_WEIGHT = 0.7;
+const AMOUNT_WEIGHT = 0.3;
+const MAX_MATCHES_PER_DISTRICT = 30;
+
+function computeNeedLevels(district, benchmark) {
+  return NEED_DIMENSIONS.map((dim) => ({ ...dim, score: dim.level(district, benchmark) }));
+}
+
+function computeMatchScore(district, grant, benchmark, maxGrantAmount) {
+  const levels = computeNeedLevels(district, benchmark);
+  const neededTagWeight = {};
+  for (const dim of levels) {
+    if (dim.score == null) continue;
+    const w = dim.score === 3 ? 1 : dim.score === 2 ? 0.5 : 0.15;
+    for (const tag of dim.tags) {
+      neededTagWeight[tag] = Math.max(neededTagWeight[tag] || 0, w);
+    }
+  }
+
+  const focusAreas = Array.isArray(grant.focus_area) ? grant.focus_area : [];
+  let needComponent = 0.2;
+  if (focusAreas.length) {
+    const weights = focusAreas.map((tag) => neededTagWeight[tag] || 0);
+    needComponent = Math.max(...weights, weights.reduce((s, w) => s + w, 0) / weights.length);
+  }
+
+  const amount = grant.possible_funding_amount || 0;
+  const amountComponent = Math.log10(amount + 1) / Math.log10(maxGrantAmount + 1);
+
+  const matchScore = NEED_WEIGHT * needComponent + AMOUNT_WEIGHT * amountComponent;
+
+  const matchedDims = levels.filter((dim) => dim.score != null && dim.score >= 2 && dim.tags.some((t) => focusAreas.includes(t)));
+  const reasonParts = matchedDims.map((dim) => `${dim.label.toLowerCase()} (${dim.score === 3 ? "high" : "medium"} need)`);
+  const matchReason = reasonParts.length
+    ? `Matches on: ${reasonParts.join(", ")}`
+    : "General fit based on grant size; no specific need-area overlap found";
+
+  return { matchScore: Math.round(matchScore * 1000) / 1000, matchReason };
+}
+
+export async function computeAllMatches() {
+  const { data: districts, error: dError } = await supabase.from("districts").select("*");
+  if (dError) throw new Error(`Failed to load districts: ${dError.message}`);
+
+  const { data: grants, error: gError } = await supabase.from("grants").select("*").eq("status", "active");
+  if (gError) throw new Error(`Failed to load grants: ${gError.message}`);
+
+  const districtsWithSetting = (districts || []).map((d) => ({
+    ...d,
+    districtSetting: d.raw_source_payload && d.raw_source_payload["District Setting"] ? d.raw_source_payload["District Setting"] : null,
+  }));
+
+  const withPerPupil = districtsWithSetting.filter((d) => d.per_pupil_revenue != null);
+  const benchmark = withPerPupil.length
+    ? withPerPupil.reduce((s, d) => s + d.per_pupil_revenue, 0) / withPerPupil.length
+    : null;
+
+  const maxGrantAmount = Math.max(1, ...(grants || []).map((g) => g.possible_funding_amount || 0));
+
+  console.log(`[matchGrants] Computing matches for ${districtsWithSetting.length} districts x ${grants.length} grants...`);
+
+  const allMatchRows = [];
+  for (const district of districtsWithSetting) {
+    const scored = grants.map((grant) => {
+      const { matchScore, matchReason } = computeMatchScore(district, grant, benchmark, maxGrantAmount);
+      return { district_id: district.id, grant_id: grant.id, match_score: matchScore, match_reason: matchReason };
+    });
+
+    scored.sort((a, b) => b.match_score - a.match_score);
+    allMatchRows.push(...scored.slice(0, MAX_MATCHES_PER_DISTRICT));
+  }
+
+  console.log(`[matchGrants] Computed ${allMatchRows.length} total match rows (top ${MAX_MATCHES_PER_DISTRICT} per district).`);
+  return allMatchRows;
+}
+
+export async function upsertMatches(matchRows) {
+  if (!matchRows.length) return { inserted: 0, failed: 0 };
+
+  const { error: deleteError } = await supabase.from("district_grant_matches").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+  if (deleteError) {
+    console.error("[matchGrants] Failed to clear old matches:", deleteError.message);
+  }
+
+  const BATCH_SIZE = 500;
+  let inserted = 0;
+  let failed = 0;
+
+  for (let i = 0; i < matchRows.length; i += BATCH_SIZE) {
+    const batch = matchRows.slice(i, i + BATCH_SIZE);
+    const { data, error } = await supabase.from("district_grant_matches").insert(batch).select("id");
+    if (error) {
+      console.error(`[matchGrants] Batch insert failed (rows ${i}-${i + batch.length}):`, error.message);
+      failed += batch.length;
+    } else {
+      inserted += data.length;
+    }
+  }
+
+  return { inserted, failed };
+}
